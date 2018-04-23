@@ -1,17 +1,23 @@
+import os
 import argparse
 import time
 import math
 import numpy as np
 import torch
 import torch.nn as nn
+import logging
 from torch.autograd import Variable
 
 import data
 import model
 
 from utils import batchify, get_batch, repackage_hidden
+from tools.log import setup_logging, ResultsLog
+from tools.optim import OptimRegime
+from tools.meters import accuracy, AverageMeter
 
-parser = argparse.ArgumentParser(description='PyTorch PennTreeBank RNN/LSTM Language Model')
+parser = argparse.ArgumentParser(
+    description='PyTorch PennTreeBank RNN/LSTM Language Model')
 parser.add_argument('--data', type=str, default='data/penn/',
                     help='location of the data corpus')
 parser.add_argument('--model', type=str, default='LSTM',
@@ -48,11 +54,13 @@ parser.add_argument('--nonmono', type=int, default=5,
                     help='random seed')
 parser.add_argument('--cuda', action='store_false',
                     help='use CUDA')
-parser.add_argument('--log-interval', type=int, default=200, metavar='N',
+parser.add_argument('--log-interval', type=int, default=100, metavar='N',
                     help='report interval')
 randomhash = ''.join(str(time.time()).split('.'))
-parser.add_argument('--save', type=str,  default=randomhash+'.pt',
+parser.add_argument('--save', type=str,  default=randomhash,
                     help='path to save the final model')
+parser.add_argument('--results_dir', metavar='RESULTS_DIR', default='./results',
+                    help='results dir')
 parser.add_argument('--alpha', type=float, default=2,
                     help='alpha L2 regularization on RNN activation (alpha = 0 means no regularization)')
 parser.add_argument('--beta', type=float, default=1,
@@ -61,8 +69,8 @@ parser.add_argument('--wdecay', type=float, default=1.2e-6,
                     help='weight decay applied to all weights')
 parser.add_argument('--resume', type=str,  default='',
                     help='path of model to resume')
-parser.add_argument('--optimizer', type=str,  default='sgd',
-                    help='optimizer to use (sgd, adam)')
+parser.add_argument('--optimizer', type=str,  default='SGD',
+                    help='optimizer to use (SGD, Adam, ...)')
 parser.add_argument('--when', nargs="+", type=int, default=[-1],
                     help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
 args = parser.parse_args()
@@ -73,17 +81,33 @@ np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 if torch.cuda.is_available():
     if not args.cuda:
-        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+        logging.info(
+            "WARNING: You have a CUDA device, so you should probably run with --cuda")
     else:
         torch.cuda.manual_seed(args.seed)
+
+###############################################################################
+# Configure log
+###############################################################################
+
+save_path = os.path.join(args.results_dir, args.save)
+if not os.path.exists(save_path):
+    os.makedirs(save_path)
+
+setup_logging(os.path.join(save_path, 'log.txt'), resume=args.resume)
+results = ResultsLog(os.path.join(save_path, 'results'),
+                     title='Training Results - %s' % args.save)
+args.save = save_path + '.pt'
 
 ###############################################################################
 # Load data
 ###############################################################################
 
+
 def model_save(fn):
     with open(fn, 'wb') as f:
         torch.save([model, criterion, optimizer], f)
+
 
 def model_load(fn):
     global model, criterion, optimizer
@@ -94,10 +118,10 @@ import os
 import hashlib
 fn = 'corpus.{}.data'.format(hashlib.md5(args.data.encode()).hexdigest())
 if os.path.exists(fn):
-    print('Loading cached dataset...')
+    logging.info('Loading cached dataset...')
     corpus = torch.load(fn)
 else:
-    print('Producing dataset...')
+    logging.info('Producing dataset...')
     corpus = data.Corpus(args.data)
     torch.save(corpus, fn)
 
@@ -115,18 +139,21 @@ from splitcross import SplitCrossEntropyLoss
 criterion = None
 
 ntokens = len(corpus.dictionary)
-model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
+model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers,
+                       args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
 ###
 if args.resume:
-    print('Resuming model ...')
+    logging.info('Resuming model ...')
     model_load(args.resume)
     optimizer.param_groups[0]['lr'] = args.lr
     model.dropouti, model.dropouth, model.dropout, args.dropoute = args.dropouti, args.dropouth, args.dropout, args.dropoute
     if args.wdrop:
         from weight_drop import WeightDrop
         for rnn in model.rnns:
-            if type(rnn) == WeightDrop: rnn.dropout = args.wdrop
-            elif rnn.zoneout > 0: rnn.zoneout = args.wdrop
+            if type(rnn) == WeightDrop:
+                rnn.dropout = args.wdrop
+            elif rnn.zoneout > 0:
+                rnn.zoneout = args.wdrop
 ###
 if not criterion:
     splits = []
@@ -139,162 +166,185 @@ if not criterion:
         # WikiText-103
         splits = [2800, 20000, 76000]
     print('Using', splits)
-    criterion = SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
+    criterion = SplitCrossEntropyLoss(
+        args.emsize, splits=splits, verbose=False)
 ###
 if args.cuda:
     model = model.cuda()
     criterion = criterion.cuda()
 ###
 params = list(model.parameters()) + list(criterion.parameters())
-total_params = sum(x.size()[0] * x.size()[1] if len(x.size()) > 1 else x.size()[0] for x in params if x.size())
-print('Args:', args)
-print('Model total parameters:', total_params)
+total_params = sum(x.numel() for x in params if x.size())
+logging.info('Args: %s' % args)
+logging.info('Model total parameters: %s' % total_params)
 
 ###############################################################################
 # Training code
 ###############################################################################
 
+
 def evaluate(data_source, batch_size=10):
     # Turn on evaluation mode which disables dropout.
     model.eval()
-    if args.model == 'QRNN': model.reset()
-    total_loss = 0
+    if args.model == 'QRNN':
+        model.reset()
+    loss_measure = AverageMeter()
+    acc_measure = AverageMeter()
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(batch_size)
     for i in range(0, data_source.size(0) - 1, args.bptt):
         data, targets = get_batch(data_source, i, args, evaluation=True)
         output, hidden = model(data, hidden)
-        total_loss += len(data) * criterion(model.decoder.weight, model.decoder.bias, output, targets).data
+        loss = criterion(model.decoder.weight,
+                         model.decoder.bias, output, targets).data
+        loss_measure.update(float(loss), targets.nelement())
+        acc = float(accuracy(output.data, targets.data)[0])
+        acc_measure.update(acc, targets.nelement())
         hidden = repackage_hidden(hidden)
-    return total_loss[0] / len(data_source)
+    return loss_measure.avg, acc_measure.avg
 
 
-def train():
+def train(data):
     # Turn on training mode which enables dropout.
-    if args.model == 'QRNN': model.reset()
-    total_loss = 0
+    if args.model == 'QRNN':
+        model.reset()
+    loss_measure = AverageMeter()
+    acc_measure = AverageMeter()
     start_time = time.time()
-    ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(args.batch_size)
     batch, i = 0, 0
-    while i < train_data.size(0) - 1 - 1:
+    model.train()
+    while i < data.size(0) - 1 - 1:
         bptt = args.bptt if np.random.random() < 0.95 else args.bptt / 2.
         # Prevent excessively small or negative sequence lengths
         seq_len = max(5, int(np.random.normal(bptt, 5)))
         # There's a very small chance that it could select a very long sequence length resulting in OOM
         # seq_len = min(seq_len, args.bptt + 10)
 
-        lr2 = optimizer.param_groups[0]['lr']
-        optimizer.param_groups[0]['lr'] = lr2 * seq_len / args.bptt
-        model.train()
-        data, targets = get_batch(train_data, i, args, seq_len=seq_len)
+        inputs, targets = get_batch(data, i, args, seq_len=seq_len)
 
         # Starting each batch, we detach the hidden state from how it was previously produced.
-        # If we didn't, the model would try backpropagating all the way to start of the dataset.
+        # If we didn't, the model would try backpropagating all the way to
+        # start of the dataset.
         hidden = repackage_hidden(hidden)
-        optimizer.zero_grad()
 
-        output, hidden, rnn_hs, dropped_rnn_hs = model(data, hidden, return_h=True)
-        raw_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets)
-
+        output, hidden, rnn_hs, dropped_rnn_hs = model(
+            inputs, hidden, return_h=True)
+        raw_loss = criterion(model.decoder.weight,
+                             model.decoder.bias, output, targets)
         loss = raw_loss
         # Activiation Regularization
-        if args.alpha: loss = loss + sum(args.alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
+        if args.alpha:
+            loss = loss + sum(args.alpha * dropped_rnn_h.pow(2).mean()
+                              for dropped_rnn_h in dropped_rnn_hs[-1:])
         # Temporal Activation Regularization (slowness)
-        if args.beta: loss = loss + sum(args.beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
-        loss.backward()
+        if args.beta:
+            loss = loss + \
+                sum(args.beta * (rnn_h[1:] - rnn_h[:-1]
+                                 ).pow(2).mean() for rnn_h in rnn_hs[-1:])
+        loss *= (seq_len / args.bptt)  # adjust loss by length
 
+        optimizer.zero_grad()
+        loss.backward()
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
-        if args.clip: torch.nn.utils.clip_grad_norm(params, args.clip)
+        if args.clip:
+            torch.nn.utils.clip_grad_norm(params, args.clip)
         optimizer.step()
 
-        total_loss += raw_loss.data
-        optimizer.param_groups[0]['lr'] = lr2
+        # Update measurments
+        loss_measure.update(float(raw_loss), targets.nelement())
+        acc = float(accuracy(output.data, targets.data)[0])
+        acc_measure.update(acc, targets.nelement())
+
         if batch % args.log_interval == 0 and batch > 0:
-            cur_loss = total_loss[0] / args.log_interval
+            cur_loss = loss_measure.avg
             elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
-                    'loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f}'.format(
-                epoch, batch, len(train_data) // args.bptt, optimizer.param_groups[0]['lr'],
-                elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), cur_loss / math.log(2)))
-            total_loss = 0
+            logging.info('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
+                         'loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f}'.format(
+                             epoch, batch, len(
+                                 data) // args.bptt, optimizer.optimizer.param_groups[0]['lr'],
+                             elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), cur_loss / math.log(2)))
+
             start_time = time.time()
         ###
-        batch += 1
         i += seq_len
+        batch += 1
+    return loss_measure.avg, acc_measure.avg
 
 # Loop over epochs.
 lr = args.lr
 best_val_loss = []
-stored_loss = 100000000
+stored_loss = float('inf')
 
 # At any point you can hit Ctrl + C to break out of training early.
 try:
-    optimizer = None
-    # Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
-    if args.optimizer == 'sgd':
-        optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
-    if args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
-    for epoch in range(1, args.epochs+1):
+    # Ensure the optimizer is optimizing params, which includes both the
+    # model's weights as well as the criterion's weight (i.e. Adaptive
+    # Softmax)
+    optimizer = OptimRegime(params, None)
+    optimizer.adjust({'epoch': 0,
+                      'optimizer': args.optimizer,
+                      'lr': lr,
+                      'weight_decay': args.wdecay})
+    for epoch in range(1, args.epochs + 1):
         epoch_start_time = time.time()
-        train()
-        if 't0' in optimizer.param_groups[0]:
-            tmp = {}
-            for prm in model.parameters():
-                tmp[prm] = prm.data.clone()
-                prm.data = optimizer.state[prm]['ax'].clone()
+        train_loss, train_accuracy = train(train_data)
+        val_loss, val_accuracy = evaluate(val_data, eval_batch_size)
+        results.add(epoch=epoch,
+                    train_loss=train_loss, val_loss=val_loss,
+                    train_ppl=math.exp(train_loss), val_ppl=math.exp(val_loss),
+                    train_error=100 - train_accuracy, val_error=100 - val_accuracy)
+        results.plot(x='epoch', y=['train_loss', 'val_loss'],
+                     legend=['training', 'validation'],
+                     title='Loss', ylabel='loss')
+        results.plot(x='epoch', y=['train_error', 'val_error'],
+                     legend=['training', 'validation'],
+                     title='Error', ylabel='error %')
+        results.plot(x='epoch', y=['train_ppl', 'val_ppl'],
+                     legend=['training', 'validation'],
+                     title='Perplexity', ylabel='perplexity')
+        results.save()
 
-            val_loss2 = evaluate(val_data)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-              epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
-            print('-' * 89)
+        logging.info('-' * 89)
+        logging.info('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                     'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
+                         epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
+        logging.info('-' * 89)
 
-            if val_loss2 < stored_loss:
-                model_save(args.save)
-                print('Saving Averaged!')
-                stored_loss = val_loss2
+        if val_loss < stored_loss:
+            model_save(args.save)
+            logging.info('Saving model (new best validation)')
+            stored_loss = val_loss
 
-            for prm in model.parameters():
-                prm.data = tmp[prm].clone()
+        if args.optimizer == 'SGD' and (len(best_val_loss) > args.nonmono and val_loss > min(best_val_loss[:-args.nonmono])):
+            logging.info('Switching to ASGD')
+            optimizer = optimizer.adjust(dict(
+                optimizer='ASGD',
+                lr=lr,
+                t0=0,
+                lambd=0.,
+                weight_decay=args.wdecay
+            ))
 
-        else:
-            val_loss = evaluate(val_data, eval_batch_size)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-              epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
-            print('-' * 89)
+        if epoch in args.when:
+            logging.info('Saving model before learning rate decreased')
+            model_save('{}.e{}'.format(args.save, epoch))
+            logging.info('Dividing learning rate by 10')
+            lr /= 10.
+            optimizer = optimizer.adjust({'lr': lr})
 
-            if val_loss < stored_loss:
-                model_save(args.save)
-                print('Saving model (new best validation)')
-                stored_loss = val_loss
-
-            if args.optimizer == 'sgd' and 't0' not in optimizer.param_groups[0] and (len(best_val_loss)>args.nonmono and val_loss > min(best_val_loss[:-args.nonmono])):
-                print('Switching to ASGD')
-                optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
-
-            if epoch in args.when:
-                print('Saving model before learning rate decreased')
-                model_save('{}.e{}'.format(args.save, epoch))
-                print('Dividing learning rate by 10')
-                optimizer.param_groups[0]['lr'] /= 10.
-
-            best_val_loss.append(val_loss)
+        best_val_loss.append(val_loss)
 
 except KeyboardInterrupt:
-    print('-' * 89)
-    print('Exiting from training early')
+    logging.info('-' * 89)
+    logging.info('Exiting from training early')
 
 # Load the best saved model.
 model_load(args.save)
 
 # Run on test data.
-test_loss = evaluate(test_data, test_batch_size)
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
+test_loss, test_accuracy = evaluate(test_data, test_batch_size)
+logging.info('=' * 89)
+logging.info('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
     test_loss, math.exp(test_loss), test_loss / math.log(2)))
-print('=' * 89)
+logging.info('=' * 89)
